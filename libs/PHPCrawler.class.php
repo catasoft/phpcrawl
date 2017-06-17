@@ -127,7 +127,14 @@ class PHPCrawler
    * @var int One of the PHPCrawlerUrlCacheTypes::URLCACHE..-constants.
    */
   protected $url_cache_type = 1;
-  
+
+  /**
+   * For MySQL link cache type, will contain the config for the db connection (db name, host, username, password).
+   *
+   * @var array $url_cache_type_config
+   */
+  protected $url_cache_type_config = null;
+
   /**
    * UID of this instance of the crawler
    *
@@ -228,7 +235,8 @@ class PHPCrawler
     if (!class_exists("PHPCrawlerURLCacheBase")) include_once($classpath."/UrlCache/PHPCrawlerURLCacheBase.class.php");
     if (!class_exists("PHPCrawlerMemoryURLCache")) include_once($classpath."/UrlCache/PHPCrawlerMemoryURLCache.class.php");
     if (!class_exists("PHPCrawlerSQLiteURLCache")) include_once($classpath."/UrlCache/PHPCrawlerSQLiteURLCache.class.php");
-    
+    if (!class_exists("PHPCrawlerMySQLURLCache")) include_once($classpath."/UrlCache/PHPCrawlerMySQLURLCache.class.php");
+
     // PageRequest-class
     if (!class_exists("PHPCrawlerHTTPRequest")) include_once($classpath."/PHPCrawlerHTTPRequest.class.php");
     $this->PageRequest = new PHPCrawlerHTTPRequest();
@@ -301,12 +309,9 @@ class PHPCrawler
   {
     // Create working directory
     $this->createWorkingDirectory();
-    
+
     // Setup url-cache
-    if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_SQLITE) 
-      $this->LinkCache = new PHPCrawlerSQLiteURLCache($this->working_directory."urlcache.db3", true);
-    else
-      $this->LinkCache = new PHPCrawlerMemoryURLCache();
+    $this->initCache();
     
     // Perge/cleanup SQLite-urlcache for resumed crawling-processes (only ONCE!)
     if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_SQLITE && $this->urlcache_purged == false)
@@ -1859,19 +1864,34 @@ class PHPCrawler
    *
    * @param int $url_cache_type 1 -> in-memory-cache (default setting)
    *                            2 -> SQlite-database-cache
+   *                            3 -> MySQL-database-cache
    *
    *                            Or one of the {@link PHPCrawlerUrlCacheTypes}::URLCACHE..-constants.
    * @return bool
    * @section 1 Basic settings
    */
-  public function setUrlCacheType($url_cache_type)
+  public function setUrlCacheType($url_cache_type, $config = null)
   {
-    if (preg_match("#[1-2]#", $url_cache_type))
+    if (preg_match("#[1-3]#", $url_cache_type))
     {
       $this->url_cache_type = $url_cache_type;
+      $this->url_cache_type_config = $config;
       return true;
     }
     else return false;
+  }
+
+  private function initCache() {
+    if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_SQLITE)
+      $this->LinkCache = new PHPCrawlerSQLiteURLCache($this->working_directory."urlcache.db3", true);
+    else if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_MYSQL)
+      $this->LinkCache = new PHPCrawlerMySQLURLCache($this->url_cache_type_config);
+    else
+      $this->LinkCache = new PHPCrawlerMemoryURLCache();
+  }
+
+  public function getUrlCacheType() {
+    return $this->url_cache_type;
   }
   
   /**
@@ -2006,7 +2026,8 @@ class PHPCrawler
   public function enableResumption()
   {
     $this->resumtion_enabled = true;
-    $this->setUrlCacheType(PHPCrawlerUrlCacheTypes::URLCACHE_SQLITE);
+    if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_MEMORY)
+      $this->setUrlCacheType(PHPCrawlerUrlCacheTypes::URLCACHE_SQLITE);
   }
   
   /**
