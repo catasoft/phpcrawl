@@ -2,6 +2,31 @@
 /**
  * Class for caching/storing URLs/links in a MySQL-database-file.
  *
+ * This class is supposed to work also on multiple sources, and we don't want to delete the url's, nor create one database for each source,
+ * as in the case of SQLite.
+ *
+ * Crawler link cache setup could be done like this:
+ * $crawler->setUrlCacheType(PHPCrawlerUrlCacheTypes::URLCACHE_MYSQL, array(
+      'db' => 'crawler_test',
+      'host' => 'mysql_host',
+        'username' => 'mysql_username',
+        'password' => 'mysql_password',
+        'create_tables' => true
+      ), array(
+          'crawler_uniqid' => array(
+          'type' => 'bigint',
+          'value' => $crawlerId,
+          'filter' => true
+        ),
+          'is_article' => array(
+          'type' => 'integer',
+          'value' => 0,
+          'filter' => false
+        )
+      ));
+ *
+ * Then you may call go() or goMultiProcessed().
+ *
  * @package phpcrawl
  * @internal
  */
@@ -26,6 +51,14 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
   protected $mysql_username;
   protected $mysql_password;
 
+  /**
+   * For MySQL link cache type, will contain values for some default fields.
+   * Usually will only contain the crawler_uniqid, used during Insert and also during search, to only lookup urls through those pertaining to the current website.
+   *
+   * @var array $db_filters
+   */
+  protected $db_filters = null;
+
   protected $db_analyzed = false;
 
   /**
@@ -34,19 +67,45 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
    * @param string $dbName          The MySQL database to use
    * @param bool   $create_tables   Defines whether all necessary tables should be created
    */
-  public function __construct($config, $create_tables = false)
+  public function __construct($config, $dbFilters = null)
   {
     $this->mysql_db = $config['db'];
     $this->mysql_host = $config['host'];
     $this->mysql_username = $config['username'];
     $this->mysql_password = $config['password'];
-    if (!isset($config['create_tables'])) $config['create_tables'] = false;
+    if (!isset($config['create_tables']))
+      $config['create_tables'] = false;
+
+    $this->db_filters = $dbFilters;
+
+    // Initialize the missing parameters from filter config
+    foreach($this->db_filters as $fld => &$fldConfig) {
+      if ( ! isset($fldConfig['type']) )
+        throw new \Exception('Missing type for field "'.$fld.'" in url cache configuration');
+      if ( ! isset($fldConfig['create']) )
+        $fldConfig['create'] = true;
+      if ( ! isset($fldConfig['filter']) )
+        $fldConfig['filter'] = false;
+    }
+
     $this->openConnection($config['create_tables']);
+  }
+
+  private function getDefaultFilters() {
+    $filters = array();
+    foreach($this->db_filters as $fld=>$config) {
+      if ($config['filter'])
+        $filters[] = "$fld = ".$config['value'];
+    }
+    return implode(' AND ', $filters);
   }
 
   public function getUrlCount()
   {
-    $Result = $this->PDO->query("SELECT count(id) AS sum FROM urls WHERE processed = 0;");
+    $sql = "SELECT count(id) AS sum FROM urls WHERE processed = 0";
+    $sql .= ' AND '.$this->getDefaultFilters();
+
+    $Result = $this->PDO->query($sql);
     $row = $Result->fetch(PDO::FETCH_ASSOC);
     $Result->closeCursor();
     return $row["sum"];
@@ -61,27 +120,36 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
   public function getNextUrl()
   {
     PHPCrawlerBenchmark::start("fetching_next_url_from_MySQLcache");
-     $ok = $this->PDO->exec("START TRANSACTION");
+
+    $ok = $this->PDO->exec("START TRANSACTION");
 
     // Get row with max priority-level
-    $Result = $this->PDO->query("SELECT max(priority_level) AS max_priority_level FROM urls WHERE in_process = 0 AND processed = 0;");
+    $sql = "SELECT max(priority_level) AS max_priority_level FROM urls WHERE in_process = 0 AND processed = 0";
+    $sql .= ' AND '.$this->getDefaultFilters();
+
+    //echo $sql."\r\n";
+    $Result = $this->PDO->query($sql);
     $row = $Result->fetch(PDO::FETCH_ASSOC);
 
-    if ($row["max_priority_level"] == null)
+    if ( is_null($row["max_priority_level"]) )
     {
       $Result->closeCursor();
       $this->PDO->exec("COMMIT;");
       return null;
     }
 
-    $Result = $this->PDO->query("SELECT * FROM urls WHERE priority_level = ".$row["max_priority_level"]." and in_process = 0 AND processed = 0;");
+    $sql = "SELECT * FROM urls WHERE priority_level = ".$row["max_priority_level"]." and in_process = 0 AND processed = 0";
+    $sql .= ' AND '.$this->getDefaultFilters();
+    $sql .= ' LIMIT 1';
+
+    $Result = $this->PDO->query($sql);
     $row = $Result->fetch(PDO::FETCH_ASSOC);
     $Result->closeCursor();
 
     // Update row (set in process-flag)
-    $this->PDO->exec("UPDATE urls SET in_process = 1 WHERE id = ".$row["id"].";");
+    $this->PDO->exec("UPDATE urls SET in_process = 1 WHERE id = ".$row["id"]);
 
-    $this->PDO->exec("COMMIT;");
+    $this->PDO->exec("COMMIT");
     PHPCrawlerBenchmark::stop("fetching_next_url_from_mysqlcache");
 
     // Return URL
@@ -100,8 +168,12 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
    */
   public function clear()
   {
+    throw new \Exception('The urls table is not meant to be emptied: it will work as a permanent repository of all urls ever scanned');
+
      try {
-        $this->PDO->exec("DELETE FROM urls;");
+       $sql = "DELETE FROM urls";
+       $sql .= ' WHERE '.$this->getDefaultFilters();
+        $this->PDO->exec($sql);
         //$this->PDO->exec("VACUUM;");
      } catch (PDOException $e){
        
@@ -130,7 +202,9 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
     // Insert URL via prepared statement
     try
     {
-      $this->PreparedInsertStatement->execute(array(":priority_level" => $priority_level,
+
+      $values = array(
+          ":priority_level" => $priority_level,
           ":distinct_hash" => $map_key,
           ":link_raw" => $UrlDescriptor->link_raw,
           ":linkcode" => $UrlDescriptor->linkcode,
@@ -138,9 +212,20 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
           ":refering_url" => $UrlDescriptor->refering_url,
           ":url_rebuild" => $UrlDescriptor->url_rebuild,
           ":is_redirect_url" => $UrlDescriptor->is_redirect_url,
-          ":url_link_depth" => $UrlDescriptor->url_link_depth));
+          ":url_link_depth" => $UrlDescriptor->url_link_depth
+      );
+
+      foreach($this->db_filters as $fieldName => $config) {
+        $values[":$fieldName"] = $config['value'];
+      }
+
+      $res = $this->PreparedInsertStatement->execute($values);
+      /*echo 'INSERTING url... in '.__FUNCTION__."\r\n";
+      echo 'Result: ';var_dump($res);echo "\r\n";
+      print_r($this->PDO->errorInfo());
+      echo "\r\n"; */
     }
-    catch (Exception $e)
+    catch (\Exception $e)
     {
       $this->createPreparedInsertStatement(true);
       $this->addURL($UrlDescriptor);
@@ -156,7 +241,7 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
   {
     PHPCrawlerBenchmark::start("adding_urls_to_mysqlcache");
     try {
-      $this->PDO->exec("BEGIN EXCLUSIVE TRANSACTION;");
+      $this->PDO->exec("START TRANSACTION");
 
       $cnt = count($urls);
       for ($x=0; $x<$cnt; $x++)
@@ -169,17 +254,17 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
         // Commit after 1000 URLs (reduces memory-usage)
         if ($x%1000 == 0 && $x > 0)
         {
-          $this->PDO->exec("COMMIT;");
-          $this->PDO->exec("BEGIN EXCLUSIVE TRANSACTION;");
+          $this->PDO->exec("COMMIT");
+          $this->PDO->exec("START TRANSACTION");
         }
       }
 
-      $this->PDO->exec("COMMIT;");
+      $this->PDO->exec("COMMIT");
       $this->PreparedInsertStatement->closeCursor();
 
       if ($this->db_analyzed == false)
       {
-        $this->PDO->exec("ANALYZE;");
+        //$this->PDO->exec("ANALYZE");
         $this->db_analyzed = true;
       }
     } catch (PDOException $e){
@@ -201,7 +286,8 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
     PHPCrawlerBenchmark::start("marking_url_as_followes");
     $hash = md5($UrlDescriptor->url_rebuild);
     try {
-      $this->PDO->exec("UPDATE urls SET processed = 1, in_process = 0, http_code = " . $http_code . " WHERE distinct_hash = '".$hash."';");
+      $sql = "UPDATE urls SET processed = 1, in_process = 0, http_code = " . $http_code . " WHERE ".$this->getDefaultFilters()." AND distinct_hash = '".$hash."'";
+      $this->PDO->exec($sql);
     } catch (Exception $e) {
 
     }
@@ -217,23 +303,28 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
   {
     PHPCrawlerBenchmark::start("checking_for_urls_in_cache");
     try {
-    $Result = $this->PDO->query("SELECT id FROM urls WHERE processed = 0 OR in_process = 1 LIMIT 1;");
+      $sql = "SELECT id FROM urls WHERE ".$this->getDefaultFilters()." AND (processed = 0 OR in_process = 1) LIMIT 1";
+      $Result = $this->PDO->query($sql);
+      /*echo $sql."\r\n";
+      var_dump($Result);echo "\r\n";
+      print_r($this->PDO->errorInfo());
+      echo "\r\n";*/
 
-    $has_columns = $Result->fetchColumn();
+      $has_columns = $Result->fetchColumn();
 
-    $Result->closeCursor();
+      $Result->closeCursor();
 
-    PHPCrawlerBenchmark::stop("checking_for_urls_in_cache");
+      PHPCrawlerBenchmark::stop("checking_for_urls_in_cache");
 
-    if ($has_columns != false)
-    {
-      return true;
-    }
-    else return false;
-    } catch (PDOException $e){
-       
+      if ($has_columns != false) {
+        return true;
+      } else
+        return false;
+
+    } catch (\PDOException $e){
+
     } catch (Exception $e){
-      
+
     }
   }
 
@@ -244,12 +335,30 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
   {
     // Set "in_process" to 0 for all URLs
     try {
-      $this->PDO->exec("UPDATE urls SET in_process = 0;");
+      $this->PDO->exec("UPDATE urls SET in_process = 0 WHERE ".$this->getDefaultFilters());
     } catch (PDOException $e){
        
     } catch (Exception $e){
       
     }
+  }
+
+
+  protected function getDefaultColumns() {
+    return array(
+        'id' => 'integer PRIMARY KEY AUTO_INCREMENT',
+        'in_process' => 'bool DEFAULT 0',
+        'processed' => 'bool DEFAULT 0',
+        'priority_level' => 'integer',
+        'distinct_hash' => 'char(32) NOT NULL UNIQUE',
+        'link_raw' => 'TEXT',
+        'linkcode' => 'TEXT',
+        'linktext' => 'TEXT',
+        'refering_url' => 'TEXT',
+        'url_rebuild' => 'TEXT',
+        'is_redirect_url' => 'bool',
+        'http_code' => 'integer',
+        'url_link_depth' => 'integer');
   }
 
   /**
@@ -271,42 +380,46 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
     }
 
     // Open mysql db
-    try
-    {
+    try {
       $this->PDO = new PDO("mysql:dbname={$this->mysql_db};host={$this->mysql_host}", $this->mysql_username, $this->mysql_password);
     }
-    catch (Exception $e)
-    {
-      throw new Exception("Error creating MySQL-cache-file, ".$e->getMessage().", try installing mysql3-extension for PHP.");
+    catch (Exception $e) {
+      $dbNotExisting = true;
+      echo "MySQL connection error: ".$e->getMessage();
     }
 
-    $this->PDO->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_SILENT);
+    $this->PDO->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_SILENT); // ERRMODE_EXCEPTION
     $this->PDO->setAttribute(PDO::ATTR_TIMEOUT, 3000);
 
     if ($create_tables == true)
     {
+      $columns = $this->getDefaultColumns();
       // Create url-table (if not exists)
-      $this->PDO->exec("CREATE TABLE IF NOT EXISTS urls (id integer PRIMARY KEY AUTO_INCREMENT,
-                                                         in_process bool DEFAULT 0,
-                                                         processed bool DEFAULT 0,
-                                                         priority_level integer,
-                                                         distinct_hash TEXT,
-                                                         link_raw TEXT,
-                                                         linkcode TEXT,
-                                                         linktext TEXT,
-                                                         refering_url TEXT,
-                                                         url_rebuild TEXT,
-                                                         is_redirect_url bool,
-                                                         http_code integer,
-                                                         url_link_depth integer);");
 
-      // Create indexes (seems that indexes make the whole thingy slower)
-      $this->PDO->exec("ALTER TABLE priority_level ADD INDEX (priority_level);");
-      $this->PDO->exec("ALTER TABLE distinct_hash ADD INDEX (distinct_hash);");
-      $this->PDO->exec("ALTER TABLE in_process ADD INDEX (in_process);");
-      $this->PDO->exec("ALTER TABLE processed ADD INDEX (processed);");
+      foreach($this->db_filters as $fieldName => $config) {
+        $columns["$fieldName"] = $config['type'];
+      }
 
-      $this->PDO->exec("ANALYZE;");
+      $sqlParts = array();
+      foreach($columns as $cName => $cType) {
+        $sqlParts[] = $cName.' '.$cType;
+      }
+
+      try {
+        $this->PDO->exec("CREATE TABLE IF NOT EXISTS urls (".implode(', ', $sqlParts).");");
+
+        // Create indexes (seems that indexes make the whole thingy slower)
+        $this->PDO->exec("ALTER TABLE urls ADD INDEX index_crawler_uniqid (crawler_uniqid);");
+        $this->PDO->exec("ALTER TABLE urls ADD INDEX index_priority_level (priority_level);");
+        $this->PDO->exec("ALTER TABLE urls ADD INDEX index_distinct_hash (distinct_hash);");
+        $this->PDO->exec("ALTER TABLE urls ADD INDEX index_in_process (in_process);");
+        $this->PDO->exec("ALTER TABLE urls ADD INDEX index_processed (processed);");
+
+        //$this->PDO->exec("ANALYZE;");
+      } catch(\PDOException $e) {
+        echo $e->getMessage();
+      }
+
     }
 
     PHPCrawlerBenchmark::stop("connecting_to_mysql_db");
@@ -321,17 +434,37 @@ class PHPCrawlerMySQLURLCache extends PHPCrawlerURLCacheBase
   {
     if ($this->PreparedInsertStatement == null || $recreate == true)
     {
+
+      $columns = array(
+          'priority_level',
+          'distinct_hash',
+          'link_raw',
+          'linkcode',
+          'linktext',
+          'refering_url',
+          'url_rebuild',
+          'is_redirect_url',
+          'url_link_depth');
+      $values = array(
+          ':priority_level',
+          ':distinct_hash',
+          ':link_raw',
+          ':linkcode',
+          ':linktext',
+          ':refering_url',
+          ':url_rebuild',
+          ':is_redirect_url',
+          ':url_link_depth');
+
+      foreach($this->db_filters as $fieldName => $config) {
+        $columns[] = "$fieldName";
+        $values[] = ":$fieldName";
+      }
+
+      $sql = "INSERT INTO urls (".implode(', ', $columns).") VALUES (".implode(', ', $values).")";
       // Prepared statement for URL-inserts
-      $this->PreparedInsertStatement = $this->PDO->prepare("INSERT IGNORE INTO urls (priority_level, distinct_hash, link_raw, linkcode, linktext, refering_url, url_rebuild, is_redirect_url, url_link_depth)
-                                                            VALUES(:priority_level,
-                                                                   :distinct_hash,
-                                                                   :link_raw,
-                                                                   :linkcode,
-                                                                   :linktext,
-                                                                   :refering_url,
-                                                                   :url_rebuild,
-                                                                   :is_redirect_url,
-                                                                   :url_link_depth);");
+      // Prepared statement for URL-inserts
+      $this->PreparedInsertStatement = $this->PDO->prepare($sql);
     }
   }
 

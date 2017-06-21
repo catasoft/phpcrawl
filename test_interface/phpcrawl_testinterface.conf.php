@@ -6,8 +6,11 @@
 #####################################################
 
 // Username and password for the test-interface-login.
-$cfg_authUsername = "";
-$cfg_authPassword = "";
+$cfg_authUsername = "test";
+$cfg_authPassword = "test";
+
+$cfg_mysqlUsername = "root";
+$cfg_mysqlPassword = "";
 
 #####################################################
 

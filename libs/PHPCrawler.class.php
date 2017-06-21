@@ -136,6 +136,14 @@ class PHPCrawler
   protected $url_cache_type_config = null;
 
   /**
+   * For MySQL link cache type, will contain some values for some default fields.
+   * Usually will only contain the crawler_uniqid, used during Insert and also during search, to only lookup urls through those pertaining to the current website.
+   *
+   * @var array $url_cache_type_config
+   */
+  protected $db_filters = null;
+
+  /**
    * UID of this instance of the crawler
    *
    * @var string
@@ -642,7 +650,7 @@ class PHPCrawler
    * @return bool TURE if the crawling-process should be aborted after processig the URL, otherwise FALSE.
    */
   protected function processUrl(PHPCrawlerURLDescriptor $UrlDescriptor)
-  { 
+  {
     // Check for abortion from other processes first if mode is MPMODE_CHILDS_EXECUTES_USERCODE
     if ($this->multiprocess_mode == PHPCrawlerMultiProcessModes::MPMODE_CHILDS_EXECUTES_USERCODE)
     { 
@@ -1870,22 +1878,22 @@ class PHPCrawler
    * @return bool
    * @section 1 Basic settings
    */
-  public function setUrlCacheType($url_cache_type, $config = null)
+  public function setUrlCacheType($url_cache_type, $config = null, $dbFilters = null)
   {
-    if (preg_match("#[1-3]#", $url_cache_type))
-    {
+    if (preg_match("#[1-3]#", $url_cache_type)) {
       $this->url_cache_type = $url_cache_type;
       $this->url_cache_type_config = $config;
+      $this->db_filters = $dbFilters;
       return true;
-    }
-    else return false;
+    } else
+      return false;
   }
 
   private function initCache() {
     if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_SQLITE)
       $this->LinkCache = new PHPCrawlerSQLiteURLCache($this->working_directory."urlcache.db3", true);
     else if ($this->url_cache_type == PHPCrawlerUrlCacheTypes::URLCACHE_MYSQL)
-      $this->LinkCache = new PHPCrawlerMySQLURLCache($this->url_cache_type_config);
+      $this->LinkCache = new PHPCrawlerMySQLURLCache($this->url_cache_type_config, $this->db_filters);
     else
       $this->LinkCache = new PHPCrawlerMemoryURLCache();
   }
